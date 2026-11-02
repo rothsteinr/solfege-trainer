@@ -42,9 +42,15 @@
   }
 
   /* ---------- audio ---------- */
+  /* iOS: Web Audio is "ambient" by default and the silent switch mutes it.
+     "playback" (iOS 17+) makes it behave like media; "play-and-record" while the microphone is on. */
+  function setAudioSession(type) {
+    try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch (e) { /* not supported */ }
+  }
   var Audio = {
-    ctx: null, master: null, bus: null, nodes: [],
+    ctx: null, master: null, bus: null, nodes: [], unlocked: false,
     ensure: function () {
+      setAudioSession(Mic && Mic.analyser ? 'play-and-record' : 'playback');
       if (!this.ctx) {
         var AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) throw new Error('This browser has no Web Audio support.');
@@ -53,7 +59,15 @@
         var comp = this.ctx.createDynamicsCompressor();
         this.master.connect(comp); comp.connect(this.ctx.destination);
       }
-      if (this.ctx.state === 'suspended') this.ctx.resume();
+      if (this.ctx.state !== 'running') { try { this.ctx.resume(); } catch (e) { /* ignore */ } }
+      if (!this.unlocked) {
+        // play one silent sample inside the user's tap so iOS starts the audio output
+        try {
+          var b = this.ctx.createBuffer(1, 1, 22050), src = this.ctx.createBufferSource();
+          src.buffer = b; src.connect(this.ctx.destination); src.start(0);
+          this.unlocked = true;
+        } catch (e) { /* ignore */ }
+      }
       return this.ctx;
     },
     newBus: function () {
@@ -109,6 +123,7 @@
       var self = this;
       if (this.analyser) return Promise.resolve(true);
       if (!this.supported()) return Promise.reject(new Error('unsupported'));
+      setAudioSession('play-and-record');
       var ctx = Audio.ensure();
       return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
         .then(function (stream) {
@@ -933,6 +948,13 @@
     return viewHome();
   }
   window.addEventListener('hashchange', route);
+  // start audio on the first tap anywhere, so later sounds are allowed on iPhone
+  ['pointerdown', 'touchend', 'keydown'].forEach(function (ev) {
+    document.addEventListener(ev, function first() {
+      try { Audio.ensure(); } catch (e) { /* no audio */ }
+      document.removeEventListener(ev, first, true);
+    }, true);
+  });
   route();
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
