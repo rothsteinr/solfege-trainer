@@ -86,6 +86,14 @@
       }
       return this.ctx;
     },
+    rebuild: function () {
+      // close and recreate the audio engine (iPhone: after the microphone changes the audio session)
+      this.stop();
+      try { if (this.ctx) this.ctx.close(); } catch (e) { /* ignore */ }
+      if (this.mediaEl) { try { this.mediaEl.pause(); this.mediaEl.remove(); } catch (e) { /* ignore */ } }
+      this.ctx = null; this.master = null; this.mediaEl = null; this.unlocked = false;
+      return this.ensure();
+    },
     newBus: function () {
       this.stop();
       this.bus = this.ctx.createGain(); this.bus.connect(this.master);
@@ -137,30 +145,43 @@
     supported: function () { return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia); },
     start: function () {
       var self = this;
-      if (this.analyser) return Promise.resolve(true);
+      if (this.analyser && this.stream && this.stream.getAudioTracks()[0] && this.stream.getAudioTracks()[0].readyState === 'live') return Promise.resolve(true);
       if (!this.supported()) return Promise.reject(new Error('unsupported'));
       setAudioSession('play-and-record');
-      var ctx = Audio.ensure();
+      if (!IS_IOS) Audio.ensure();
       return navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
         .then(function (stream) {
           self.stream = stream;
+          var track = stream.getAudioTracks()[0];
+          self.trackRate = track && track.getSettings ? track.getSettings().sampleRate : null;
+          // iPhone: the microphone switches the audio session; a context made before that can hear silence
+          var ctx = IS_IOS ? Audio.rebuild() : Audio.ensure();
           var src = ctx.createMediaStreamSource(stream);
           self.analyser = ctx.createAnalyser(); self.analyser.fftSize = 2048;
           src.connect(self.analyser);
+          self.src = src;
           self.buf = new Float32Array(self.analyser.fftSize);
           self.error = null;
-          return true;
+          return ctx.state === 'running' ? true : ctx.resume().then(function () { return true; }, function () { return true; });
         });
+    },
+    status: function () {
+      var t = this.stream && this.stream.getAudioTracks()[0];
+      var ctx = Audio.ctx;
+      return 'Mic: ' + (t ? t.readyState + (t.muted ? ', muted' : '') : 'off') +
+        ' · audio ' + (ctx ? ctx.state + ' ' + ctx.sampleRate + ' Hz' : 'not started') +
+        (this.trackRate ? ' · mic ' + this.trackRate + ' Hz' : '') +
+        ' · level ' + (this.lastRms != null ? this.lastRms.toFixed(3) : '–') + ' · version 4';
     },
     read: function () {
       if (!this.analyser) return null;
       var ctx = Audio.ctx;
       this.analyser.getFloatTimeDomainData(this.buf);
-      var r = C.rms(this.buf);
+      var r = C.rms(this.buf); this.lastRms = r;
       var t = ctx.currentTime - this.buf.length / ctx.sampleRate / 2 - (ctx.baseLatency || 0);
-      if (r < 0.006) return { t: t, rms: r };
+      if (r < 0.003) return { t: t, rms: r };
       var y = C.yin(this.buf, ctx.sampleRate, 65, 1100, 0.15);
-      if (!y || y.clarity < 0.75) return { t: t, rms: r };
+      if (!y || y.clarity < 0.7) return { t: t, rms: r };
       return { t: t, rms: r, freq: y.freq, midi: C.freqToMidi(y.freq) };
     }
   };
@@ -876,15 +897,19 @@
     var s = S();
     var tuner = tunerWidget();
     var micBtn, micOn = false, raf = 0;
+    var lastStatus = 0;
     function micLoop() {
       if (!micOn) return;
       var r = Mic.read(); if (r) tuner.show(r, null);
+      var now = performance.now();
+      if (now - lastStatus > 250) { lastStatus = now; micMsg.textContent = Mic.status(); levelBar.style.width = Math.min(100, Math.round((Mic.lastRms || 0) * 1000)) + '%'; }
       raf = requestAnimationFrame(micLoop);
     }
+    var levelBar = h('span', { style: 'width:0%' });
     micBtn = btn('Test microphone', function () {
       if (micOn) { micOn = false; cancelAnimationFrame(raf); micBtn.textContent = 'Test microphone'; tuner.reset(); return; }
       Mic.start().then(function () { micOn = true; micBtn.textContent = 'Stop test'; micLoop(); })
-        .catch(function (err) { micMsg.textContent = micErrorText(err); });
+        .catch(function (err) { micMsg.textContent = micErrorText(err) + ' [' + (err && (err.name || err.message)) + '] · ' + Mic.status(); });
     });
     var micMsg = h('p', { class: 'small muted' });
     var soundMsg = h('p', { class: 'small muted', text: 'Not tested yet.' });
@@ -894,7 +919,7 @@
         (Audio.mediaEl ? (Audio.mediaEl.paused ? ' (paused)' : ' (playing)') : '') +
         ' · iOS session: ' + (navigator.audioSession ? navigator.audioSession.type : 'not supported') +
         ' · ' + (navigator.userAgent.match(/OS (\d+[_\d]*) like Mac/) ? 'iOS ' + navigator.userAgent.match(/OS (\d+[_\d]*) like Mac/)[1].replace(/_/g, '.') : navigator.platform) +
-        ' · version 3';
+        ' · version 4';
     }
     onLeave(function () { micOn = false; cancelAnimationFrame(raf); });
 
@@ -935,7 +960,9 @@
       h('section', { class: 'card' }, [
         h('h2', { text: 'Microphone' }),
         h('p', { class: 'muted prose', text: 'Sing a steady note. The syllable should match what you sing and the needle should settle near the centre.' }),
-        h('div', { class: 'row' }, [micBtn]), micMsg, tuner.el
+        h('div', { class: 'row' }, [micBtn]),
+        h('div', { class: 'stack small muted' }, [h('span', { text: 'Input level' }), h('div', { class: 'bar', 'aria-label': 'Microphone input level' }, [levelBar])]),
+        micMsg, tuner.el
       ]),
       h('section', { class: 'card' }, [
         h('h2', { text: 'Move progress between devices' }),
