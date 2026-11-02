@@ -47,8 +47,9 @@
   function setAudioSession(type) {
     try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch (e) { /* not supported */ }
   }
+  var IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   var Audio = {
-    ctx: null, master: null, bus: null, nodes: [], unlocked: false,
+    ctx: null, master: null, bus: null, nodes: [], unlocked: false, mediaEl: null, route: '',
     ensure: function () {
       setAudioSession(Mic && Mic.analyser ? 'play-and-record' : 'playback');
       if (!this.ctx) {
@@ -57,8 +58,23 @@
         this.ctx = new AC();
         this.master = this.ctx.createGain(); this.master.gain.value = 0.9;
         var comp = this.ctx.createDynamicsCompressor();
-        this.master.connect(comp); comp.connect(this.ctx.destination);
+        this.master.connect(comp);
+        this.route = 'speakers';
+        if (IS_IOS && this.ctx.createMediaStreamDestination) {
+          // On iPhone, play through a media element so the ring/silent switch does not mute it
+          try {
+            var dest = this.ctx.createMediaStreamDestination();
+            comp.connect(dest);
+            var el = document.createElement('audio');
+            el.setAttribute('playsinline', ''); el.autoplay = true; el.srcObject = dest.stream;
+            el.style.display = 'none'; document.body.appendChild(el);
+            this.mediaEl = el; this.route = 'media element';
+          } catch (e) { comp.connect(this.ctx.destination); this.route = 'speakers (fallback)'; }
+        } else {
+          comp.connect(this.ctx.destination);
+        }
       }
+      if (this.mediaEl && this.mediaEl.paused) { var pr = this.mediaEl.play(); if (pr && pr.catch) pr.catch(function () { /* needs a tap */ }); }
       if (this.ctx.state !== 'running') { try { this.ctx.resume(); } catch (e) { /* ignore */ } }
       if (!this.unlocked) {
         // play one silent sample inside the user's tap so iOS starts the audio output
@@ -871,6 +887,15 @@
         .catch(function (err) { micMsg.textContent = micErrorText(err); });
     });
     var micMsg = h('p', { class: 'small muted' });
+    var soundMsg = h('p', { class: 'small muted', text: 'Not tested yet.' });
+    function soundInfo() {
+      var a = Audio.ctx;
+      soundMsg.textContent = 'Audio: ' + (a ? a.state : 'not started') + ' · output: ' + (Audio.route || '–') +
+        (Audio.mediaEl ? (Audio.mediaEl.paused ? ' (paused)' : ' (playing)') : '') +
+        ' · iOS session: ' + (navigator.audioSession ? navigator.audioSession.type : 'not supported') +
+        ' · ' + (navigator.userAgent.match(/OS (\d+[_\d]*) like Mac/) ? 'iOS ' + navigator.userAgent.match(/OS (\d+[_\d]*) like Mac/)[1].replace(/_/g, '.') : navigator.platform) +
+        ' · version 3';
+    }
     onLeave(function () { micOn = false; cancelAnimationFrame(raf); });
 
     function segField(label, help, options, value, onset) {
@@ -895,6 +920,17 @@
         segField('Pass mark', 'Share of notes that must be in tune (within 50 cents) to pass a lesson.', [[80, '80%'], [90, '90%'], [95, '95%']], s.pass, function (v) { s.pass = v; }),
         segField('Click volume', null, [[0, 'Off'], [0.25, 'Soft'], [0.5, 'Medium'], [0.9, 'Loud']], s.clickVol, function (v) { s.clickVol = v; }),
         segField('Reaction allowance', 'How far behind the beat the app still counts your note.', [[0.04, 'Tight'], [0.08, 'Normal'], [0.15, 'Relaxed']], s.reaction, function (v) { s.reaction = v; })
+      ]),
+      h('section', { class: 'card' }, [
+        h('h2', { text: 'Sound check' }),
+        h('p', { class: 'muted prose', text: 'Plays the C chord and then la. If you hear nothing, read out the line below it.' }),
+        h('div', { class: 'row' }, [btn('▶ Play test sound', function () {
+          try {
+            var ctx = Audio.ensure(); Audio.newBus();
+            Audio.chord([60, 64, 67, 72], ctx.currentTime + 0.1, 1.2); Audio.tone(69, ctx.currentTime + 1.5, 1.0, 0.25);
+            setTimeout(soundInfo, 400);
+          } catch (e) { soundMsg.textContent = 'Audio failed: ' + e.message; }
+        })]), soundMsg
       ]),
       h('section', { class: 'card' }, [
         h('h2', { text: 'Microphone' }),
